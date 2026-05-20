@@ -1,5 +1,4 @@
-// InvTube v2 - Vercel Serverless Proxy
-// Invidious 인스턴스 목록 (2025년 5월 기준 안정적인 것들)
+// InvTube v2 - Vercel Serverless Proxy (CommonJS)
 const INSTANCES = [
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
@@ -10,12 +9,11 @@ const INSTANCES = [
   'https://invidious.io.lol',
   'https://invidious.fdn.fr',
   'https://invidious.privacydev.net',
-  'https://vid.puffyan.us',
   'https://invidious.protokolla.fi',
   'https://invidious.tiekoetter.com',
+  'https://invidious.perennialte.ch',
 ];
 
-// 현재 인스턴스 인덱스 (메모리, 함수 재시작 시 리셋됨)
 let currentIdx = 0;
 
 function getInstance() {
@@ -27,11 +25,12 @@ function nextInstance() {
   return getInstance();
 }
 
-async function fetchWithTimeout(url, options = {}, timeout = 8000) {
+async function fetchWithTimeout(url, options, timeout) {
+  timeout = timeout || 8000;
   const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
+  const id = setTimeout(function() { controller.abort(); }, timeout);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
     clearTimeout(id);
     return res;
   } catch (e) {
@@ -40,166 +39,147 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
   }
 }
 
-// 인스턴스 순환하며 API 호출
-async function fetchInvidious(path, retries = INSTANCES.length) {
-  let lastErr;
-  const tried = new Set();
-  for (let i = 0; i < retries; i++) {
-    const base = getInstance();
-    if (tried.has(base)) { nextInstance(); continue; }
-    tried.add(base);
-    const url = `${base}/api/v1${path}`;
-    try {
-      const res = await fetchWithTimeout(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; InvTube/2.0)',
-          'Accept': 'application/json',
-        }
-      }, 9000);
-      if (!res.ok) {
-        console.warn(`[InvTube] ${base} → HTTP ${res.status}`);
-        nextInstance();
-        continue;
-      }
-      const data = await res.json();
-      // 빈 응답 거부
-      if (data === null || data === undefined) {
-        nextInstance();
-        continue;
-      }
-      return { data, instance: base };
-    } catch (e) {
-      console.warn(`[InvTube] ${base} → ${e.message}`);
-      lastErr = e;
-      nextInstance();
-    }
+// 여러 인스턴스 동시에 시도 → 제일 빠른 것 사용
+async function fetchInvidious(path) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (compatible; InvTube/2.0)',
+    'Accept': 'application/json',
+  };
+
+  // 인스턴스 3개 동시에 쏘고 제일 먼저 성공한 거 사용
+  const shuffled = [...INSTANCES].sort(() => Math.random() - 0.5).slice(0, 4);
+
+  const attempts = shuffled.map(async function(base) {
+    const url = base + '/api/v1' + path;
+    const res = await fetchWithTimeout(url, { headers: headers }, 9000);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    if (!data) throw new Error('empty response');
+    return { data: data, instance: base };
+  });
+
+  try {
+    return await Promise.any(attempts);
+  } catch (e) {
+    throw new Error('모든 인스턴스 실패: ' + (e.errors ? e.errors.map(function(x){return x.message;}).join(', ') : e.message));
   }
-  throw lastErr || new Error('모든 인스턴스가 응답하지 않습니다');
 }
 
-export default async function handler(req, res) {
-  // CORS 헤더
+// 배열 정규화 유틸
+function toArray(data) {
+  if (Array.isArray(data)) return data;
+  return data.videos || data.trending || data.items || data.results ||
+    (Object.values(data).find(function(v){ return Array.isArray(v); })) || [];
+}
+
+module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-  res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate=300');
 
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
-  const { type, id, q, page = 1, region = 'KR' } = req.query;
+  const query = req.query || {};
+  const type = query.type;
+  const id = query.id;
+  const q = query.q;
+  const page = query.page || 1;
+  const region = query.region || 'KR';
 
   try {
-    // 1) 비디오 정보 + 스트림 URL
-    if (type === 'video') {
-      if (!id) return res.status(400).json({ error: 'id 필요' });
-      const { data, instance } = await fetchInvidious(`/videos/${id}?fields=title,author,authorId,description,publishedText,viewCount,likeCount,lengthSeconds,formatStreams,adaptiveFormats,videoThumbnails,recommendedVideos`);
-
-      // 스트림 URL을 우리 프록시로 래핑
-      const streams = (data.formatStreams || []).map(s => ({
-        quality: s.qualityLabel || s.quality,
-        type: s.type,
-        url: `/api/proxy?type=stream&url=${encodeURIComponent(s.url)}&instance=${encodeURIComponent(instance)}`,
-        itag: s.itag,
-      }));
-
-      return res.status(200).json({
-        ...data,
-        streams,
-        instance,
-      });
+    // 트렌딩
+    if (type === 'trending') {
+      let result;
+      try {
+        result = await fetchInvidious('/trending?region=' + region + '&type=default');
+      } catch(e) {
+        // region 없이 재시도
+        result = await fetchInvidious('/trending');
+      }
+      const list = toArray(result.data);
+      if (!list.length) throw new Error('빈 트렌딩 응답');
+      res.setHeader('Cache-Control', 's-maxage=120');
+      return res.status(200).json(list.slice(0, 24));
     }
 
-    // 2) 비디오 스트림 프록시 (실제 영상 바이트 전달)
+    // 검색
+    if (type === 'search') {
+      if (!q) return res.status(400).json({ error: 'q 필요' });
+      const result = await fetchInvidious(
+        '/search?q=' + encodeURIComponent(q) + '&page=' + page + '&type=video&sort_by=relevance'
+      );
+      const list = toArray(result.data);
+      res.setHeader('Cache-Control', 's-maxage=60');
+      return res.status(200).json(list);
+    }
+
+    // 비디오 정보
+    if (type === 'video') {
+      if (!id) return res.status(400).json({ error: 'id 필요' });
+      const result = await fetchInvidious(
+        '/videos/' + id + '?fields=title,author,authorId,description,publishedText,viewCount,likeCount,lengthSeconds,formatStreams,videoThumbnails,recommendedVideos'
+      );
+      const data = result.data;
+      const instance = result.instance;
+
+      const streams = (data.formatStreams || []).map(function(s) {
+        return {
+          quality: s.qualityLabel || s.quality,
+          type: s.type,
+          // 스트림을 직접 프록시로 래핑
+          url: '/api/proxy?type=stream&url=' + encodeURIComponent(s.url),
+          itag: s.itag,
+        };
+      });
+
+      res.setHeader('Cache-Control', 's-maxage=30');
+      return res.status(200).json(Object.assign({}, data, { streams: streams, instance: instance }));
+    }
+
+    // 스트림 프록시
     if (type === 'stream') {
-      const { url: streamUrl } = req.query;
+      const streamUrl = query.url;
       if (!streamUrl) return res.status(400).json({ error: 'url 필요' });
 
       const decodedUrl = decodeURIComponent(streamUrl);
       const range = req.headers['range'];
-
-      const upstreamHeaders = {
+      const upHeaders = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Referer': 'https://www.youtube.com/',
-        'Origin': 'https://www.youtube.com',
       };
-      if (range) upstreamHeaders['Range'] = range;
+      if (range) upHeaders['Range'] = range;
 
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 25000);
-
-      const upstream = await fetch(decodedUrl, {
-        headers: upstreamHeaders,
-        signal: controller.signal,
-      });
+      const timeout = setTimeout(function(){ controller.abort(); }, 25000);
+      const upstream = await fetch(decodedUrl, { headers: upHeaders, signal: controller.signal });
       clearTimeout(timeout);
 
-      // 응답 헤더 복사
-      const forwardHeaders = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
-      forwardHeaders.forEach(h => {
+      ['content-type','content-length','content-range','accept-ranges'].forEach(function(h) {
         const v = upstream.headers.get(h);
         if (v) res.setHeader(h, v);
       });
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Cache-Control', 'public, max-age=3600');
-
       res.status(upstream.status);
 
-      // 스트림 파이프
       const reader = upstream.body.getReader();
-      const pump = async () => {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { res.end(); break; }
-          res.write(Buffer.from(value));
-        }
-      };
-      return pump();
-    }
-
-    // 3) 검색
-    if (type === 'search') {
-      if (!q) return res.status(400).json({ error: 'q 필요' });
-      const { data } = await fetchInvidious(
-        `/search?q=${encodeURIComponent(q)}&page=${page}&type=video&region=${region}&sort_by=relevance`
-      );
-      // 배열 정규화
-      const list = Array.isArray(data) ? data : (data.results || data.videos || data.items || []);
-      return res.status(200).json(list);
-    }
-
-    // 4) 트렌딩
-    if (type === 'trending') {
-      const { data } = await fetchInvidious(`/trending?region=${region}&type=default`);
-      // 인스턴스마다 응답 형식이 다름: 배열 or { videos: [...] } or { trending: [...] }
-      let list = data;
-      if (!Array.isArray(list)) {
-        list = data.videos || data.trending || data.items || Object.values(data).find(v => Array.isArray(v)) || [];
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) { res.end(); break; }
+        res.write(Buffer.from(chunk.value));
       }
-      if (!list.length) throw new Error('트렌딩 데이터 없음');
-      return res.status(200).json(list.slice(0, 24));
+      return;
     }
 
-    // 5) 채널 정보
-    if (type === 'channel') {
-      if (!id) return res.status(400).json({ error: 'id 필요' });
-      const { data } = await fetchInvidious(`/channels/${id}`);
-      return res.status(200).json(data);
-    }
-
-    // 6) 인스턴스 상태 확인
+    // 핑
     if (type === 'ping') {
-      return res.status(200).json({ instance: getInstance(), idx: currentIdx });
+      return res.status(200).json({ instance: getInstance(), total: INSTANCES.length });
     }
 
-    return res.status(400).json({ error: '알 수 없는 type' });
+    return res.status(400).json({ error: '알 수 없는 type: ' + type });
 
   } catch (err) {
-    console.error('[InvTube Error]', err.message);
-    return res.status(500).json({
-      error: '서버 오류',
-      message: err.message,
-    });
+    console.error('[InvTube]', err.message);
+    return res.status(500).json({ error: '서버 오류', message: err.message });
   }
-}
+};
