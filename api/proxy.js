@@ -1,16 +1,18 @@
 // InvTube v2 - Vercel Serverless Proxy
-// Invidious 인스턴스 목록 (속도 좋은 순)
+// Invidious 인스턴스 목록 (2025년 5월 기준 안정적인 것들)
 const INSTANCES = [
-  'https://invidious.fdn.fr',
   'https://inv.nadeko.net',
   'https://invidious.nerdvpn.de',
-  'https://invidious.privacydev.net',
   'https://yt.cdaut.de',
   'https://invidious.lunar.icu',
   'https://iv.melmac.space',
-  'https://invidious.perennialte.ch',
   'https://invidious.slipfox.xyz',
   'https://invidious.io.lol',
+  'https://invidious.fdn.fr',
+  'https://invidious.privacydev.net',
+  'https://vid.puffyan.us',
+  'https://invidious.protokolla.fi',
+  'https://invidious.tiekoetter.com',
 ];
 
 // 현재 인스턴스 인덱스 (메모리, 함수 재시작 시 리셋됨)
@@ -39,27 +41,40 @@ async function fetchWithTimeout(url, options = {}, timeout = 8000) {
 }
 
 // 인스턴스 순환하며 API 호출
-async function fetchInvidious(path, retries = 3) {
+async function fetchInvidious(path, retries = INSTANCES.length) {
   let lastErr;
+  const tried = new Set();
   for (let i = 0; i < retries; i++) {
     const base = getInstance();
+    if (tried.has(base)) { nextInstance(); continue; }
+    tried.add(base);
     const url = `${base}/api/v1${path}`;
     try {
       const res = await fetchWithTimeout(url, {
-        headers: { 'User-Agent': 'InvTube/2.0' }
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; InvTube/2.0)',
+          'Accept': 'application/json',
+        }
       }, 9000);
       if (!res.ok) {
+        console.warn(`[InvTube] ${base} → HTTP ${res.status}`);
         nextInstance();
         continue;
       }
       const data = await res.json();
+      // 빈 응답 거부
+      if (data === null || data === undefined) {
+        nextInstance();
+        continue;
+      }
       return { data, instance: base };
     } catch (e) {
+      console.warn(`[InvTube] ${base} → ${e.message}`);
       lastErr = e;
       nextInstance();
     }
   }
-  throw lastErr || new Error('모든 인스턴스 실패');
+  throw lastErr || new Error('모든 인스턴스가 응답하지 않습니다');
 }
 
 export default async function handler(req, res) {
@@ -149,13 +164,21 @@ export default async function handler(req, res) {
       const { data } = await fetchInvidious(
         `/search?q=${encodeURIComponent(q)}&page=${page}&type=video&region=${region}&sort_by=relevance`
       );
-      return res.status(200).json(data);
+      // 배열 정규화
+      const list = Array.isArray(data) ? data : (data.results || data.videos || data.items || []);
+      return res.status(200).json(list);
     }
 
     // 4) 트렌딩
     if (type === 'trending') {
       const { data } = await fetchInvidious(`/trending?region=${region}&type=default`);
-      return res.status(200).json(data.slice(0, 24));
+      // 인스턴스마다 응답 형식이 다름: 배열 or { videos: [...] } or { trending: [...] }
+      let list = data;
+      if (!Array.isArray(list)) {
+        list = data.videos || data.trending || data.items || Object.values(data).find(v => Array.isArray(v)) || [];
+      }
+      if (!list.length) throw new Error('트렌딩 데이터 없음');
+      return res.status(200).json(list.slice(0, 24));
     }
 
     // 5) 채널 정보
