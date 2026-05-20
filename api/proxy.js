@@ -1,51 +1,53 @@
-// InvTube v2 - Piped API 기반 프록시
-// Piped는 Invidious와 달리 Vercel 서버 IP를 잘 허용함
+// InvTube v2 - 타임아웃 최적화 버전
+// Vercel Hobby 플랜 = 함수 최대 10초
 
-const PIPED_INSTANCES = [
+const PIPED = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
   'https://piped-api.garudalinux.org',
-  'https://api.piped.projectsegfau.lt',
-  'https://pipedapi.in.projectsegfau.lt',
 ];
 
-const INV_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://yt.cdaut.de',
-  'https://invidious.nerdvpn.de',
-  'https://yewtu.be',
-  'https://invidious.fdn.fr',
-];
-
-async function fetchTimeout(url, opts, ms) {
-  ms = ms || 8000;
-  const ctrl = new AbortController();
-  const t = setTimeout(function() { ctrl.abort(); }, ms);
+async function ft(url, ms) {
+  ms = ms || 3500;
+  const c = new AbortController();
+  const t = setTimeout(function(){ c.abort(); }, ms);
   try {
-    const r = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+    const r = await fetch(url, {
+      signal: c.signal,
+      headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' }
+    });
     clearTimeout(t);
-    return r;
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
   } catch(e) { clearTimeout(t); throw e; }
 }
 
-// 여러 인스턴스 동시에 쏴서 제일 빠른 성공 반환
-async function raceInstances(instances, pathFn, validateFn) {
-  const tasks = instances.map(async function(base) {
-    const url = base + pathFn(base);
-    const r = await fetchTimeout(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
-    }, 8000);
-    if (!r.ok) throw new Error(base + ' HTTP ' + r.status);
-    const data = await r.json();
-    if (validateFn && !validateFn(data)) throw new Error(base + ' invalid data');
-    return { data: data, instance: base };
+// Promise.any 대신 직접 구현 (구버전 Node 호환)
+async function raceAny(fns) {
+  return new Promise(function(resolve, reject) {
+    let done = false, errs = [], left = fns.length;
+    fns.forEach(function(fn) {
+      fn().then(function(v) {
+        if (!done) { done = true; resolve(v); }
+      }).catch(function(e) {
+        errs.push(e.message);
+        left--;
+        if (left === 0 && !done) reject(new Error(errs.join(' | ')));
+      });
+    });
   });
-  try {
-    return await Promise.any(tasks);
-  } catch(e) {
-    const msgs = e.errors ? e.errors.map(function(x){return x.message;}).slice(0,3).join(' | ') : String(e);
-    throw new Error('모든 인스턴스 실패: ' + msgs);
-  }
+}
+
+function pipedVideoToCommon(v) {
+  return {
+    videoId: (v.url||'').replace('/watch?v=',''),
+    title: v.title || '',
+    author: v.uploaderName || v.author || '',
+    viewCount: v.views || v.viewCount || 0,
+    publishedText: v.uploadedDate || v.publishedText || '',
+    lengthSeconds: v.duration || v.lengthSeconds || 0,
+    videoThumbnails: [{ url: v.thumbnail || '', quality: 'high', width: 480 }],
+  };
 }
 
 module.exports = async function handler(req, res) {
@@ -57,181 +59,111 @@ module.exports = async function handler(req, res) {
   const q = req.query || {};
   const type = q.type || '';
 
-  // ── 디버그: 어떤 인스턴스가 살아있는지 확인 ──
-  if (type === 'test') {
-    const results = {};
-    const tests = PIPED_INSTANCES.slice(0,3).map(async function(base) {
-      try {
-        const r = await fetchTimeout(base + '/trending?region=KR', {}, 5000);
-        const d = await r.json();
-        const arr = Array.isArray(d) ? d : [];
-        results[base] = arr.length ? 'OK (' + arr.length + '개)' : 'EMPTY';
-      } catch(e) { results[base] = 'FAIL: ' + e.message; }
-    });
-    await Promise.allSettled(tests);
-    return res.status(200).json({ piped: results, time: new Date().toISOString() });
-  }
+  try {
 
-  // ── 트렌딩 (Piped 우선) ──
-  if (type === 'trending') {
-    try {
+    // ── 디버그 테스트 ──
+    if (type === 'test') {
+      const results = {};
+      await Promise.allSettled(PIPED.map(async function(base) {
+        try {
+          const d = await ft(base + '/trending?region=KR', 4000);
+          results[base] = Array.isArray(d) ? 'OK:' + d.length : 'BAD_FORMAT:' + JSON.stringify(d).slice(0,80);
+        } catch(e) { results[base] = 'FAIL:' + e.message; }
+      }));
+      return res.status(200).json(results);
+    }
+
+    // ── 트렌딩 ──
+    if (type === 'trending') {
       const region = q.region || 'KR';
-      const result = await raceInstances(
-        PIPED_INSTANCES,
-        function() { return '/trending?region=' + region; },
-        function(d) { return Array.isArray(d) && d.length > 0; }
-      );
-      // Piped 형식 → 통합 형식 변환
-      const list = result.data.slice(0, 24).map(function(v) {
-        return {
-          videoId: v.url ? v.url.replace('/watch?v=','') : v.videoId,
-          title: v.title,
-          author: v.uploaderName || v.author,
-          viewCount: v.views || v.viewCount,
-          publishedText: v.uploadedDate || v.publishedText,
-          lengthSeconds: v.duration || v.lengthSeconds,
-          videoThumbnails: [{ url: v.thumbnail, quality: 'high', width: 480 }],
+      const data = await raceAny(PIPED.map(function(base) {
+        return function() {
+          return ft(base + '/trending?region=' + region, 4000).then(function(d) {
+            if (!Array.isArray(d) || !d.length) throw new Error('empty');
+            return d;
+          });
         };
-      });
+      }));
       res.setHeader('Cache-Control', 's-maxage=120');
-      return res.status(200).json(list);
-    } catch(e) {
-      // Invidious 폴백
-      try {
-        const r2 = await raceInstances(
-          INV_INSTANCES,
-          function() { return '/api/v1/trending'; },
-          function(d) { return Array.isArray(d) && d.length > 0; }
-        );
-        res.setHeader('Cache-Control', 's-maxage=120');
-        return res.status(200).json(r2.data.slice(0,24));
-      } catch(e2) {
-        return res.status(500).json({ error: 'trending 실패', piped: e.message, invidious: e2.message });
-      }
+      return res.status(200).json(data.slice(0, 24).map(pipedVideoToCommon));
     }
-  }
 
-  // ── 검색 (Piped 우선) ──
-  if (type === 'search') {
-    if (!q.q) return res.status(400).json({ error: 'q 필요' });
-    try {
-      const result = await raceInstances(
-        PIPED_INSTANCES,
-        function() { return '/search?q=' + encodeURIComponent(q.q) + '&filter=videos'; },
-        function(d) { return d && (Array.isArray(d.items) || Array.isArray(d)); }
-      );
-      const raw = Array.isArray(result.data) ? result.data : (result.data.items || []);
-      const list = raw.map(function(v) {
-        return {
-          videoId: v.url ? v.url.replace('/watch?v=','') : v.videoId,
-          title: v.title,
-          author: v.uploaderName || v.author,
-          viewCount: v.views || v.viewCount,
-          publishedText: v.uploadedDate || v.publishedText,
-          lengthSeconds: v.duration || v.lengthSeconds,
-          videoThumbnails: [{ url: v.thumbnail, quality: 'high', width: 480 }],
+    // ── 검색 ──
+    if (type === 'search') {
+      if (!q.q) return res.status(400).json({ error: 'q 필요' });
+      const data = await raceAny(PIPED.map(function(base) {
+        return function() {
+          return ft(base + '/search?q=' + encodeURIComponent(q.q) + '&filter=videos', 4000).then(function(d) {
+            const arr = Array.isArray(d) ? d : (d.items || []);
+            if (!arr.length) throw new Error('empty');
+            return arr;
+          });
         };
-      });
+      }));
       res.setHeader('Cache-Control', 's-maxage=60');
-      return res.status(200).json(list);
-    } catch(e) {
-      try {
-        const r2 = await raceInstances(
-          INV_INSTANCES,
-          function() { return '/api/v1/search?q=' + encodeURIComponent(q.q) + '&type=video'; },
-          null
-        );
-        const arr = Array.isArray(r2.data) ? r2.data : [];
-        return res.status(200).json(arr);
-      } catch(e2) {
-        return res.status(500).json({ error: '검색 실패', detail: e.message });
-      }
+      return res.status(200).json(data.map(pipedVideoToCommon));
     }
-  }
 
-  // ── 비디오 정보 (Piped 우선) ──
-  if (type === 'video') {
-    if (!q.id) return res.status(400).json({ error: 'id 필요' });
-    try {
-      const result = await raceInstances(
-        PIPED_INSTANCES,
-        function() { return '/streams/' + q.id; },
-        function(d) { return d && d.title; }
-      );
-      const d = result.data;
-      // Piped 스트림 형식 변환
+    // ── 비디오 정보 ──
+    if (type === 'video') {
+      if (!q.id) return res.status(400).json({ error: 'id 필요' });
+      const data = await raceAny(PIPED.map(function(base) {
+        return function() {
+          return ft(base + '/streams/' + q.id, 5000).then(function(d) {
+            if (!d || !d.title) throw new Error('no title');
+            return { d: d, base: base };
+          });
+        };
+      }));
+
+      const d = data.d;
       const streams = (d.videoStreams || [])
-        .filter(function(s) { return s.mimeType && s.mimeType.includes('video/mp4') && s.videoOnly === false; })
-        .sort(function(a,b) { return (b.quality||'').localeCompare(a.quality||''); })
+        .filter(function(s) { return s.mimeType && s.mimeType.includes('video/mp4') && !s.videoOnly; })
         .map(function(s) {
           return {
-            quality: s.quality,
+            quality: s.quality || '',
             url: '/api/proxy?type=stream&url=' + encodeURIComponent(s.url),
           };
         });
-      const thumbUrl = d.thumbnailUrl || '';
-      const related = (d.relatedStreams || []).slice(0,15).map(function(v) {
+
+      const related = (d.relatedStreams || []).slice(0, 15).map(function(v) {
         return {
-          videoId: v.url ? v.url.replace('/watch?v=','') : '',
-          title: v.title,
+          videoId: (v.url||'').replace('/watch?v=',''),
+          title: v.title || '',
           author: v.uploaderName || '',
-          lengthSeconds: v.duration,
-          videoThumbnails: [{ url: v.thumbnail, quality: 'high', width: 480 }],
+          lengthSeconds: v.duration || 0,
+          videoThumbnails: [{ url: v.thumbnail || '', quality: 'high', width: 480 }],
         };
       });
+
       res.setHeader('Cache-Control', 's-maxage=30');
       return res.status(200).json({
         title: d.title,
         author: d.uploader,
-        description: d.description,
+        description: d.description || '',
         viewCount: d.views,
         likeCount: d.likes,
-        publishedText: d.uploadDate,
-        videoThumbnails: [{ url: thumbUrl, quality: 'maxresdefault', width: 1280 }],
+        publishedText: d.uploadDate || '',
+        videoThumbnails: [{ url: d.thumbnailUrl || '', quality: 'maxresdefault', width: 1280 }],
         streams: streams,
         recommendedVideos: related,
-        instance: result.instance,
+        instance: data.base,
       });
-    } catch(e) {
-      // Invidious 폴백
-      try {
-        const r2 = await raceInstances(
-          INV_INSTANCES,
-          function() { return '/api/v1/videos/' + q.id; },
-          function(d) { return d && d.title; }
-        );
-        const d2 = r2.data;
-        const streams2 = (d2.formatStreams || [])
-          .filter(function(s) { return s.type && s.type.includes('mp4'); })
-          .map(function(s) {
-            return {
-              quality: s.qualityLabel || s.quality,
-              url: '/api/proxy?type=stream&url=' + encodeURIComponent(s.url),
-            };
-          });
-        res.setHeader('Cache-Control', 's-maxage=30');
-        return res.status(200).json(Object.assign({}, d2, { streams: streams2, instance: r2.instance }));
-      } catch(e2) {
-        return res.status(500).json({ error: '비디오 정보 실패', detail: e.message, fallback: e2.message });
-      }
     }
-  }
 
-  // ── 스트림 프록시 ──
-  if (type === 'stream') {
-    const su = q.url;
-    if (!su) return res.status(400).json({ error: 'url 필요' });
-    const decoded = decodeURIComponent(su);
-    const range = req.headers['range'];
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Referer': 'https://www.youtube.com/',
-    };
-    if (range) headers['Range'] = range;
-    try {
-      const ctrl = new AbortController();
-      const t = setTimeout(function(){ ctrl.abort(); }, 28000);
-      const up = await fetch(decoded, { headers: headers, signal: ctrl.signal });
+    // ── 스트림 프록시 ──
+    if (type === 'stream') {
+      if (!q.url) return res.status(400).json({ error: 'url 필요' });
+      const decoded = decodeURIComponent(q.url);
+      const range = req.headers['range'];
+      const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://www.youtube.com/',
+      };
+      if (range) headers['Range'] = range;
+      const c = new AbortController();
+      const t = setTimeout(function(){ c.abort(); }, 27000);
+      const up = await fetch(decoded, { headers: headers, signal: c.signal });
       clearTimeout(t);
       ['content-type','content-length','content-range','accept-ranges'].forEach(function(h) {
         const v = up.headers.get(h);
@@ -242,14 +174,15 @@ module.exports = async function handler(req, res) {
       const reader = up.body.getReader();
       while (true) {
         const chunk = await reader.read();
-        if (chunk.done) { res.end(); break; }
+        if (chunk.done) { res.end(); return; }
         res.write(Buffer.from(chunk.value));
       }
-    } catch(e) {
-      return res.status(500).json({ error: e.message });
     }
-    return;
-  }
 
-  return res.status(400).json({ error: 'type 필요: trending|search|video|stream|test' });
+    return res.status(400).json({ error: 'type 필요: trending|search|video|stream|test' });
+
+  } catch(err) {
+    console.error('[InvTube]', type, err.message);
+    return res.status(500).json({ error: err.message, type: type });
+  }
 };
